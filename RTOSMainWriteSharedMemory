@@ -1,0 +1,43 @@
+/* ========================================================================
+ * Telemetry Task — 10Hz (updates shared memory for Linux big core)
+ * ======================================================================== */
+static void task_telemetry(void *param)
+{
+    (void)param;
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t seq = 0;
+
+    printf("[TASK] Telemetry task started\n");
+
+    for (;;) {
+        battery_state_t bat;
+        safety_get_battery(&bat);
+
+        attitude_t att;
+        baro_data_t bdata;
+        rc_channels_t rc;
+        imu_data_t imu;
+        copy_telemetry_snapshot(&att, &bdata, &rc, &imu);
+
+        /* Write to shared memory */
+        telem->magic = FC_SHARED_MEM_MAGIC;
+        telem->sequence = seq++;
+        telem->timestamp = xTaskGetTickCount();
+
+        telem->roll_deg  = att.roll  * 57.2958f;  /* rad to deg */
+        telem->pitch_deg = att.pitch * 57.2958f;
+        telem->yaw_deg   = att.yaw   * 57.2958f;
+
+        telem->battery_voltage = bat.voltage;
+        telem->battery_pct = bat.percentage;
+        telem->flight_state = (uint8_t)safety_get_state();
+
+        telem->altitude = bdata.altitude;
+        telem->pressure = bdata.pressure;
+
+        telem->rc_connected = rc.signal_valid;
+        telem->imu_temp = imu.temp;
+
+        vTaskDelayUntil(&last_wake, FC_DELAY_TICKS(100));  /* 10Hz */
+    }
+}
