@@ -1,0 +1,181 @@
+/*
+ * Antigravity - Linux/web control bridge.
+ *
+ * The small core does not run navigation. It only consumes a fresh virtual RC
+ * command written by Linux. If Linux stops refreshing the command, this bridge
+ * becomes inactive within FC_LINUX_CTRL_TIMEOUT_MS and SBUS/failsafe behavior
+ * takes over.
+ */
+
+#include <stdint.h>
+#include <string.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "fc_config.h"
+#include "fc_control_wire.h"
+#include "linux_control.h"
+#include "arch_helpers.h"
+
+#if FC_LINUX_CTRL_ENABLE
+
+#define FC_CACHE_ALIGN_UP(v) (((v) + 63U) & ~63U)
+
+static volatile fc_linux_control_t *ctrl_mem =
+    (volatile fc_linux_control_t *)FC_LINUX_CTRL_MEM_ADDR;
+
+static linux_control_diag_t ctrl_diag;
+static uint32_t last_sequence;
+static TickType_t last_seen_tick;
+
+static uint16_t clamp_pwm(uint16_t v)
+{
+    if (v < ESC_PWM_MIN_US)
+        return ESC_PWM_MIN_US;
+    if (v > ESC_PWM_MAX_US)
+        return ESC_PWM_MAX_US;
+    return v;
+}
+
+static uint16_t command_ttl_ms(const fc_linux_control_t *cmd)
+{
+    if (cmd->ttl_ms == 0)
+        return FC_LINUX_CTRL_TIMEOUT_MS;
+    if (cmd->ttl_ms > FC_LINUX_CTRL_TIMEOUT_MS)
+        return FC_LINUX_CTRL_TIMEOUT_MS;
+    return cmd->ttl_ms;
+}
+
+static int read_stable_command(fc_linux_control_t *out)
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        inv_dcache_range((uintptr_t)ctrl_mem,
+                         FC_CACHE_ALIGN_UP(sizeof(fc_linux_control_t)));
+        uint32_t seq_before = ctrl_mem->write_seq;
+        if (seq_before & 1U)
+            continue;
+
+        memcpy(out, (const void *)ctrl_mem, sizeof(*out));
+
+        inv_dcache_range((uintptr_t)ctrl_mem,
+                         FC_CACHE_ALIGN_UP(sizeof(fc_linux_control_t)));
+        uint32_t seq_after = ctrl_mem->write_seq;
+        if (seq_before == seq_after && !(seq_after & 1U))
+            return 0;
+    }
+
+    ctrl_diag.bad_frame = 1;
+    return -1;
+}
+
+static int command_valid(const fc_linux_control_t *cmd)
+{
+    if (cmd->magic != FC_LINUX_CTRL_MAGIC ||
+        cmd->version != FC_LINUX_CTRL_VERSION)
+        return 0;
+
+    if (cmd->mode != FC_LINUX_CTRL_MODE_MANUAL &&
+        cmd->mode != FC_LINUX_CTRL_MODE_NAV)
+        return 0;
+
+    if (!(cmd->flags & FC_LINUX_CTRL_FLAG_ENABLE) &&
+        !(cmd->flags & FC_LINUX_CTRL_FLAG_ESTOP))
+        return 0;
+
+    return 1;
+}
+
+void linux_control_init(void)
+{
+    memset(&ctrl_diag, 0, sizeof(ctrl_diag));
+    last_sequence = 0;
+    last_seen_tick = 0;
+}
+
+void linux_control_apply(rc_channels_t *rc)
+{
+    if (!rc)
+        return;
+
+    fc_linux_control_t cmd;
+    ctrl_diag.active = 0;
+    ctrl_diag.stale = 0;
+    ctrl_diag.bad_frame = 0;
+
+    if (read_stable_command(&cmd) != 0 || !command_valid(&cmd))
+        return;
+
+    TickType_t now = xTaskGetTickCount();
+    if (cmd.sequence != last_sequence) {
+        last_sequence = cmd.sequence;
+        last_seen_tick = now;
+    }
+
+    uint32_t age_ms = last_seen_tick ?
+        (uint32_t)((now - last_seen_tick) * portTICK_PERIOD_MS) : UINT32_MAX;
+    ctrl_diag.sequence = cmd.sequence;
+    ctrl_diag.flags = cmd.flags;
+    ctrl_diag.mode = (uint8_t)cmd.mode;
+    ctrl_diag.age_ms = age_ms > UINT16_MAX ? UINT16_MAX : (uint16_t)age_ms;
+
+    if (age_ms > command_ttl_ms(&cmd)) {
+        ctrl_diag.stale = 1;
+        return;
+    }
+
+    /*
+     * Emergency stop is intentionally represented as a valid receiver frame
+     * with arm low and throttle low, so the normal arming/disarming path sees
+     * the command immediately.
+     */
+    if (cmd.flags & FC_LINUX_CTRL_FLAG_ESTOP) {
+        rc->roll = 1500;
+        rc->pitch = 1500;
+        rc->throttle = ESC_PWM_MIN_US;
+        rc->yaw = 1500;
+        rc->aux1 = 1000;
+    } else {
+        rc->roll = clamp_pwm(cmd.roll_us);
+        rc->pitch = clamp_pwm(cmd.pitch_us);
+        rc->throttle = clamp_pwm(cmd.throttle_us);
+        rc->yaw = clamp_pwm(cmd.yaw_us);
+        rc->aux1 = (cmd.flags & FC_LINUX_CTRL_FLAG_ARM) ? 1800 : 1000;
+    }
+
+    rc->aux2 = clamp_pwm(cmd.aux2_us ? cmd.aux2_us : 1500);
+    rc->aux3 = clamp_pwm(cmd.aux3_us ? cmd.aux3_us : 1500);
+    rc->channels[RC_CH_ROLL] = rc->roll;
+    rc->channels[RC_CH_PITCH] = rc->pitch;
+    rc->channels[RC_CH_THROTTLE] = rc->throttle;
+    rc->channels[RC_CH_YAW] = rc->yaw;
+    rc->channels[RC_CH_AUX1] = rc->aux1;
+    rc->channels[RC_CH_AUX2] = rc->aux2;
+    rc->channels[RC_CH_AUX3] = rc->aux3;
+    rc->frame_lost = false;
+    rc->failsafe = false;
+    rc->signal_valid = true;
+    rc->last_update = now;
+
+    ctrl_diag.active = 1;
+}
+
+void linux_control_get_diag(linux_control_diag_t *diag)
+{
+    if (!diag)
+        return;
+
+    taskENTER_CRITICAL();
+    memcpy(diag, &ctrl_diag, sizeof(*diag));
+    taskEXIT_CRITICAL();
+}
+
+#else
+
+void linux_control_init(void) {}
+void linux_control_apply(rc_channels_t *rc) { (void)rc; }
+void linux_control_get_diag(linux_control_diag_t *diag)
+{
+    if (diag)
+        memset(diag, 0, sizeof(*diag));
+}
+
+#endif /* FC_LINUX_CTRL_ENABLE */
