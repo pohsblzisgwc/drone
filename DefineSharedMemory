@@ -1,0 +1,15 @@
+/* ========================================================================
+ * Shared Memory (Big core ↔ Small core)
+ * ======================================================================== */
+#define FC_SHARED_MEM_SIZE      4096U
+#ifndef CVIMMAP_FREERTOS_ADDR
+#define CVIMMAP_FREERTOS_ADDR  0x8FE00000UL
+#endif
+#ifndef CVIMMAP_FREERTOS_SIZE
+#define CVIMMAP_FREERTOS_SIZE  0x00200000UL
+#endif
+#define FC_SHARED_MEM_ADDR      (CVIMMAP_FREERTOS_ADDR + CVIMMAP_FREERTOS_SIZE - FC_SHARED_MEM_SIZE)
+#define FC_SHARED_MEM_MAGIC     0x414E5449  /* "ANTI" */
+#define FC_IMU_DEBUG_MEM_ADDR   (FC_SHARED_MEM_ADDR + 512U)
+#define FC_LINUX_CTRL_MEM_ADDR  (FC_SHARED_MEM_ADDR + 3072U)
+#define FC_IMU_DEBUG_MAGIC      0x494D5530U  /* "IMU0" */
